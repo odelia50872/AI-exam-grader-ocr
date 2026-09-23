@@ -1,20 +1,40 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# 🎓 ExamLens – AI-Powered Exam Grading & OCR Platform
 
-# Run and deploy your AI Studio app
+An intelligent, automated exam assessment system that uses **Google Gemini Vision** to grade student code submissions, extract handwritten/typed text via high-precision OCR, and provide fair, itemized evaluation feedback.
 
-This contains everything you need to run your app locally.
+---
 
-View your app in AI Studio: https://ai.studio/apps/475f3046-abdc-4233-8f5a-1c5a8c20a27d
+## ✨ Key Features
 
-## Run Locally
+- **High-Precision Multimodal OCR:** Reads handwritten and typed code directly from PDF files or image scans.
+- **Fair & Autonomous Grading:** Evaluates student solutions against core programming logic while applying light penalties for minor syntax typos.
+- **Itemized Feedback Breakdown:** Categorizes deductions clearly into syntax/typos and logical flaws.
+- **Visual Bounding Boxes:** Highlights recognized words and code blocks directly on the scanned document.
+- **Clean & Modern UI:** A minimalist drag-and-drop interface designed for effortless grading.
 
-**Prerequisites:**  Node.js
+---
 
+## 🛠️ Tech Stack
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+- **Frontend:** React, TypeScript, Tailwind CSS
+- **Backend Services:** Node.js / Express, Python (EasyOCR / Vision Pipeline)
+- **AI Engine:** Google Gemini API (`gemini-1.5-flash` / `gemini-1.5-pro`)
+
+---
+
+## 🚀 Quick Start (Run Locally)
+
+### Prerequisites
+
+- **Node.js** (v18 or higher recommended)
+- **Python** (v3.9 or higher, required for local OCR service)
+- **Gemini API Key** (Obtain one from [Google AI Studio](https://aistudio.google.com/))
+
+---
+
+### Installation & Setup
+
+1. **Clone the repository:**
+   ```bash
+   git clone [https://github.com/your-username/exam-lens.git](https://github.com/your-username/exam-lens.git)
+   cd exam-lens
