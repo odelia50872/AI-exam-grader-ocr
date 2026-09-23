@@ -4,7 +4,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import 'dotenv/config';
 import { GoogleGenAI, Type } from '@google/genai';
-import { performDocumentOCR, performGeminiOCR, InputPage } from './server/ocrService.js';
+import { performDocumentOCR, InputPage } from './server/ocrService.js';
+import { DetectedWord } from './src/types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -322,14 +323,20 @@ app.post('/api/assess-exam', async (req, res) => {
       return res.status(500).json({ error: 'GEMINI_API_KEY is not configured in the server environment.' });
     }
 
-    // Step 1: OCR — try Gemini Vision first (fast, no local model), fall back to
-    // local EasyOCR only when Gemini returns a quota / rate-limit error (429).
-    let ocrBreakdown;
-    let ocrEngine = 'Gemini Vision';
+    // ─────────────────────────────────────────────────────────────────────────
+    // UNIFIED SINGLE-CALL APPROACH:
+    // Gemini reads the images ONCE and returns both:
+    //   (a) per-word OCR bounding boxes  [ymin, xmin, ymax, xmax] normalized 0-1000
+    //   (b) full grading evaluation JSON
+    // This eliminates the previous 2-round-trip penalty (OCR call then Grading call).
+    //
+    // FALLBACK: If Gemini returns a quota/rate-limit error we run local EasyOCR
+    // for the bounding-boxes, then make a single Grading-only Gemini call.
+    // ─────────────────────────────────────────────────────────────────────────
 
     const isQuotaError = (err: any): boolean => {
       const msg: string = (err?.message || err?.status || '').toLowerCase();
-      const code = err?.status || err?.code || 0;
+      const code = Number(err?.status || err?.code || 0);
       return (
         code === 429 ||
         msg.includes('resource_exhausted') ||
@@ -339,114 +346,180 @@ app.post('/api/assess-exam', async (req, res) => {
       );
     };
 
-    try {
-      console.log(`[OCR Engine] Running Gemini Vision OCR across ${inputPages.length} submission page(s)...`);
-      ocrBreakdown = await performGeminiOCR(inputPages, process.env.GEMINI_API_KEY!, model);
-    } catch (geminiOcrErr: any) {
-      if (isQuotaError(geminiOcrErr)) {
-        console.warn('[OCR Engine] Gemini quota/rate-limit reached — activating local EasyOCR fallback...');
-        ocrEngine = 'EasyOCR (local fallback)';
-        ocrBreakdown = await performDocumentOCR(inputPages);
-      } else {
-        throw geminiOcrErr;
-      }
-    }
+    // Combined schema: OCR words + grading fields in one JSON object
+    const combinedSchema = {
+      type: Type.OBJECT,
+      properties: {
+        // ── OCR output ───────────────────────────────────────────────────────
+        ocrWords: {
+          type: Type.ARRAY,
+          description: 'Every word token extracted from the exam images with its bounding box.',
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              word: { type: Type.STRING },
+              box_2d: { type: Type.ARRAY, items: { type: Type.INTEGER }, description: '[ymin, xmin, ymax, xmax] 0-1000' },
+              confidence: { type: Type.NUMBER },
+              page_number: { type: Type.INTEGER },
+            },
+            required: ['word', 'box_2d', 'page_number'],
+          },
+        },
+        ocrFullText: { type: Type.STRING, description: 'Complete transcribed text from all pages.' },
+        // ── Grading output (same as gradingEvaluationSchema) ─────────────────
+        ...gradingEvaluationSchema.properties,
+      },
+      required: ['ocrWords', 'ocrFullText', ...gradingEvaluationSchema.required],
+    };
 
-    console.log(`[OCR Engine] OCR complete via ${ocrEngine} — extracted ${ocrBreakdown.words.length} words.`);
-
-    // Step 2: Build Gemini Request for Autonomous Solution Generation & Academic Assessment
-    // We pass the transcribed text and image parts to Gemini
-    const contentParts: any[] = [];
-
-    // Attach images for visual context if available
+    // Build image parts
+    const imageParts: any[] = [];
     inputPages.forEach((p) => {
       if (p.imageBase64 && p.imageBase64.length > 200) {
         const clean = p.imageBase64.replace(/^data:[a-zA-Z0-9/.-]+;base64,/, '');
-        contentParts.push({
-          inlineData: {
-            mimeType: p.mimeType || 'image/jpeg',
-            data: clean,
-          },
-        });
+        imageParts.push({ inlineData: { mimeType: p.mimeType || 'image/jpeg', data: clean } });
       }
     });
 
-    const promptText = `
-You are an Expert AI Code Exam Evaluator and Precise Multimodal OCR Engine.
-Your job is to provide accurate, fair, and clutter-free exam evaluation.
+    const combinedPrompt = `You are simultaneously an expert OCR engine AND an expert Code Exam Evaluator.
+Given the exam submission image(s), perform BOTH tasks in a single pass:
 
+═══ TASK 1 — WORD-LEVEL OCR ═══
+Transcribe EVERY word visible in the image(s).
+For each word provide:
+- word: the exact string as written (do NOT fix typos or spelling)
+- box_2d: [ymin, xmin, ymax, xmax] normalized 0-1000 (top-left is 0,0; bottom-right is 1000,1000)
+- confidence: 0.0–1.0
+- page_number: 1-indexed
+Also output ocrFullText: the complete transcribed text.
+
+═══ TASK 2 — AUTONOMOUS GRADING ═══
+Master Exam Question: ${masterQuestion || 'Evaluate the student submission according to programming criteria.'}
+Maximum Points: ${maxPoints}
+${gradingGuidelines ? `Special Guidelines: ${gradingGuidelines}` : ''}
+
+GRADING RULES:
+1. AUTONOMOUS SOLVING: Deduce the correct solution yourself — no answer key needed.
+2. CORE LOGIC FOCUS: Correct algorithm/data-structure choice earns the vast majority of points.
+3. SYNTAX TOLERANCE: Deduct ≤1 pt per minor typo/syntax slip. Never penalise valid syntax (e.g. type hints).
+4. PROPORTIONAL LOGIC DEDUCTIONS: Minor API mistakes = −1 to −2 pts. Fundamental algorithm failure = −5+ pts.
+5. calculatedScore = Math.max(0, maximumPoints − Σ syntaxDeductions − Σ logicalDeductions).
+6. quickFeedback & feedback = one encouraging sentence summarising the result.
+
+Return your complete response strictly in the JSON schema provided.`;
+
+    let ocrBreakdown: any;
+    let evaluation: any;
+    let ocrEngine = 'Gemini Vision (unified OCR+Grading)';
+
+    const selectedModel = model || 'gemini-3.6-flash';
+
+    try {
+      console.log(`[Unified Engine] Single-call OCR+Grading via ${selectedModel} across ${inputPages.length} page(s)...`);
+
+      const contentParts = [...imageParts, { text: combinedPrompt }];
+      const { response, modelUsed } = await callGeminiWithResilience(
+        selectedModel,
+        { parts: contentParts },
+        combinedSchema,
+        0.1
+      );
+
+      const textOutput = response.text;
+      if (!textOutput) throw new Error('Empty response from Gemini unified call.');
+
+      const combined = JSON.parse(textOutput);
+
+      // ── Build OCRBreakdown from unified response ───────────────────────────
+      const rawWords: DetectedWord[] = (combined.ocrWords || []).map((w: any) => ({
+        word: String(w.word || '').trim(),
+        confidence: typeof w.confidence === 'number' ? Math.max(0, Math.min(1, w.confidence)) : 0.95,
+        page_number: Number(w.page_number) || 1,
+        box_2d: Array.isArray(w.box_2d) && w.box_2d.length === 4
+          ? w.box_2d.map((v: any) => Math.max(0, Math.min(1000, Math.round(Number(v))))) as [number, number, number, number]
+          : [0, 0, 50, 100] as [number, number, number, number],
+        isFlaggedMistake: false,
+      })).filter((w: DetectedWord) => w.word.length > 0);
+
+      // Build per-page transcriptions
+      const pageMap = new Map<number, string[]>();
+      rawWords.forEach((w) => {
+        const pg = w.page_number ?? 1;
+        if (!pageMap.has(pg)) pageMap.set(pg, []);
+        pageMap.get(pg)!.push(w.word);
+      });
+      const pagesTranscriptions = Array.from(pageMap.entries())
+        .sort(([a], [b]) => a - b)
+        .map(([pageNumber, words]) => ({ pageNumber, text: words.join(' ') }));
+
+      ocrBreakdown = {
+        words: rawWords,
+        transcribedFullText: combined.ocrFullText || pagesTranscriptions.map((p) => p.text).join('\n\n--- Page Break ---\n\n'),
+        pagesTranscriptions,
+      };
+
+      // ── Extract grading evaluation ─────────────────────────────────────────
+      evaluation = combined;
+      console.log(`[Unified Engine] Done — ${rawWords.length} words, score ${evaluation.calculatedScore}/${evaluation.maximumPoints} via ${modelUsed}.`);
+
+    } catch (unifiedErr: any) {
+      if (!isQuotaError(unifiedErr)) throw unifiedErr;
+
+      // ── Quota fallback: local EasyOCR → separate Gemini grading call ───────
+      console.warn('[Unified Engine] Gemini quota limit hit — falling back to EasyOCR + separate grading call...');
+      ocrEngine = 'EasyOCR (local fallback) + Gemini Grading';
+
+      ocrBreakdown = await performDocumentOCR(inputPages);
+      console.log(`[OCR Fallback] EasyOCR extracted ${ocrBreakdown.words.length} words.`);
+
+      const fallbackParts = [...imageParts, {
+        text: `You are an Expert AI Code Exam Evaluator.
 Student submission has ${inputPages.length} page(s).
-Extracted text via high-precision visual OCR:
---- TRANSCRIBED STUDENT SUBMISSION (OCR) ---
+Extracted text via high-precision OCR:
+--- TRANSCRIBED SUBMISSION ---
 ${ocrBreakdown.transcribedFullText}
 
---- MASTER EXAM QUESTION PROMPT ---
+--- MASTER EXAM QUESTION ---
 ${masterQuestion || 'Evaluate the student submission according to programming criteria.'}
-
-Maximum Points Available: ${maxPoints}
+Maximum Points: ${maxPoints}
 ${gradingGuidelines ? `Special Scoring Guidelines: ${gradingGuidelines}` : ''}
 
-GRADING POLICIES:
-1. AUTONOMOUS PROBLEM SOLVING:
-   - Automatically deduce the correct solution and logic benchmark for the Master Exam Question Prompt. No manual answer key is required.
+GRADING RULES:
+1. Deduce the correct solution autonomously — no answer key needed.
+2. Correct algorithm/data-structure choice earns the vast majority of points.
+3. Deduct ≤1 pt per minor typo/syntax slip. Never penalise valid syntax.
+4. Minor API mistakes = −1 to −2 pts. Fundamental failure = −5+ pts.
+5. calculatedScore = Math.max(0, maximumPoints − Σ syntaxDeductions − Σ logicalDeductions).
+6. quickFeedback & feedback = one encouraging sentence.
+Return strictly in JSON per schema.`,
+      }];
 
-2. CORE LOGIC FOCUS:
-   - If the student chose the correct algorithm/data structure (e.g., Stack for bracket matching), award the vast majority of points.
+      const { response: fallbackResponse } = await callGeminiWithResilience(
+        selectedModel,
+        { parts: fallbackParts },
+        gradingEvaluationSchema,
+        0.1
+      );
 
-3. STRICT 1-POINT MAX FOR SYNTAX & TYPOS:
-   - Deduct 1 point MAXIMUM per minor typo or syntax flaw (e.g., 'retur' instead of 'return', missing colon ':').
-   - Do NOT double-penalize the same typo.
-   - Do NOT penalize valid syntax (e.g., type hinting like 's: str' is 100% correct).
-
-4. PROPORTIONAL LOGICAL DEDUCTIONS:
-   - Deduct 1 to 2 points max for minor API mistakes (e.g., passing arguments to 'stack.pop()').
-   - Deduct 5+ points only if the algorithm fundamentally fails to solve the problem.
-   - For every logical flaw, specify the exact line number, a clear concise description, and an actionable quick fix.
-
-5. OUTPUT STRUCTURE:
-   - exactTranscribedCode: Clean, formatted code representing EXACTLY what was transcribed character-by-character.
-   - calculatedScore: Math.max(0, maximumPoints - sum(syntaxDeductions.deduction) - sum(logicalDeductions.deduction)).
-   - quickFeedback: A single, encouraging feedback sentence summarizing the result directly.
-   - feedback: Exactly the same single encouraging feedback sentence.
-
-Return your response strictly in JSON following the schema.
-`;
-
-    contentParts.push({ text: promptText });
-
-    const selectedModel = model || 'gemini-2.5-flash';
-    console.log(`[Assessment] Requesting autonomous evaluation via ${selectedModel}...`);
-
-    const { response, modelUsed } = await callGeminiWithResilience(
-      selectedModel,
-      { parts: contentParts },
-      gradingEvaluationSchema,
-      0.1
-    );
-
-    const textOutput = response.text;
-    if (!textOutput) {
-      throw new Error('No response text received from Gemini model.');
+      const fallbackText = fallbackResponse.text;
+      if (!fallbackText) throw new Error('No response text from Gemini grading fallback.');
+      evaluation = JSON.parse(fallbackText);
     }
 
-    const evaluation = JSON.parse(textOutput);
-
-    // Backward-compatibility aliases
+    // ── Backward-compat aliases ────────────────────────────────────────────
     evaluation.praiseAndHighlights = evaluation.recognitionOfExcellence || [];
     evaluation.constructiveFeedback = evaluation.feedback || '';
 
-    // Step 3: Synchronize Mistake Flags into OCR Word Tokens
+    // ── Flag mistake words in OCR tokens ──────────────────────────────────
     const mistakeWordsList: string[] = (evaluation.flaggedMistakeWords || []).map((w: string) =>
       w.toLowerCase().trim()
     );
-
-    // Also collect syntax and logical mistake locations
     (evaluation.syntaxDeductions || []).forEach((sd: any) => {
       if (sd.location) mistakeWordsList.push(sd.location.toLowerCase().trim());
     });
 
     if (mistakeWordsList.length > 0) {
-      ocrBreakdown.words = ocrBreakdown.words.map((detected) => {
+      ocrBreakdown.words = ocrBreakdown.words.map((detected: DetectedWord) => {
         const cleanWord = detected.word.toLowerCase().replace(/[^a-z0-9]/g, '');
         const isFlagged = mistakeWordsList.some(
           (m) =>
@@ -454,22 +527,17 @@ Return your response strictly in JSON following the schema.
             cleanWord.includes(m) ||
             (cleanWord.length > 3 && m.includes(cleanWord.slice(0, 4)))
         );
-        return {
-          ...detected,
-          isFlaggedMistake: isFlagged,
-        };
+        return { ...detected, isFlaggedMistake: isFlagged };
       });
     }
 
     res.json({
       success: true,
-      data: {
-        ocrBreakdown,
-        gradingEvaluation: evaluation,
-      },
+      data: { ocrBreakdown, gradingEvaluation: evaluation },
       modelUsed: selectedModel,
       ocrEngine,
     });
+
   } catch (error: any) {
     console.error('Error during exam assessment:', error);
     res.status(500).json({
