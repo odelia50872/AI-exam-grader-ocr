@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import readline from 'readline';
 import { createWorker, Worker } from 'tesseract.js';
 import { imageSize } from 'image-size';
+import { GoogleGenAI, Type } from '@google/genai';
 import { DetectedWord, PageTranscription, OCRBreakdown } from '../src/types.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -290,8 +291,128 @@ async function performTesseractFallbackOCR(pages: InputPage[]): Promise<OCRBreak
 }
 
 /**
+ * Gemini Vision OCR: sends images directly to Gemini and receives
+ * per-word bounding boxes in the same normalized [ymin,xmin,ymax,xmax] 0-1000 format
+ * used by EasyOCR. This is the fastest path – no local model needed.
+ *
+ * Throws on rate-limit (429 / RESOURCE_EXHAUSTED) so the caller can
+ * fall back to the local EasyOCR engine.
+ */
+export async function performGeminiOCR(
+  pages: InputPage[],
+  apiKey: string,
+  model = 'gemini-3.6-flash'
+): Promise<OCRBreakdown> {
+  const ai = new GoogleGenAI({
+    apiKey,
+    httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+  });
+
+  const ocrWordSchema = {
+    type: Type.OBJECT,
+    properties: {
+      word: { type: Type.STRING, description: 'Exact word token as it appears in the image' },
+      box_2d: {
+        type: Type.ARRAY,
+        description: 'Bounding box [ymin, xmin, ymax, xmax] normalized 0-1000',
+        items: { type: Type.INTEGER },
+      },
+      confidence: { type: Type.NUMBER, description: 'Confidence score 0.0 to 1.0' },
+      page_number: { type: Type.INTEGER, description: '1-indexed page number' },
+    },
+    required: ['word', 'box_2d', 'page_number'],
+  };
+
+  const pageResultSchema = {
+    type: Type.OBJECT,
+    properties: {
+      page_number: { type: Type.INTEGER },
+      full_text: { type: Type.STRING, description: 'Complete transcribed text for this page' },
+      words: { type: Type.ARRAY, items: ocrWordSchema },
+    },
+    required: ['page_number', 'full_text', 'words'],
+  };
+
+  const responseSchema = {
+    type: Type.OBJECT,
+    properties: {
+      pages: { type: Type.ARRAY, items: pageResultSchema },
+    },
+    required: ['pages'],
+  };
+
+  // Build content parts: one image per page
+  const contentParts: any[] = [];
+  for (const page of pages) {
+    if (page.imageBase64 && page.imageBase64.length > 200) {
+      const clean = page.imageBase64.replace(/^data:[a-zA-Z0-9/.-]+;base64,/, '');
+      contentParts.push({
+        inlineData: { mimeType: page.mimeType || 'image/jpeg', data: clean },
+      });
+    }
+  }
+
+  if (contentParts.length === 0) {
+    throw new Error('No valid images provided for Gemini OCR.');
+  }
+
+  contentParts.push({
+    text: `You are a precise OCR engine. Transcribe ALL text visible in the provided exam page image(s).
+For each unique word token, provide:
+- The exact word as written (do NOT correct typos or spelling mistakes)
+- Its bounding box as [ymin, xmin, ymax, xmax] normalized to 0-1000 range (0=top-left, 1000=bottom-right)
+- A confidence score between 0.0 and 1.0
+- The 1-indexed page number it belongs to
+
+Return every page transcription including the full_text and word-level breakdown.
+Do NOT skip any word. Do NOT merge words. Do NOT invent words.
+Images are presented in page order starting from page 1.`,
+  });
+
+  const response = await ai.models.generateContent({
+    model,
+    contents: { parts: contentParts },
+    config: {
+      responseMimeType: 'application/json',
+      responseSchema,
+      temperature: 0,
+    },
+  });
+
+  const text = response.text;
+  if (!text) throw new Error('Gemini OCR returned empty response.');
+
+  const parsed = JSON.parse(text) as { pages: Array<{ page_number: number; full_text: string; words: any[] }> };
+
+  const allWords: DetectedWord[] = [];
+  const pagesTranscriptions: PageTranscription[] = [];
+
+  for (const p of parsed.pages) {
+    const pWords: DetectedWord[] = (p.words || []).map((w: any) => ({
+      word: String(w.word || '').trim(),
+      confidence: typeof w.confidence === 'number' ? Math.max(0, Math.min(1, w.confidence)) : 0.95,
+      page_number: p.page_number,
+      box_2d: Array.isArray(w.box_2d) && w.box_2d.length === 4
+        ? (w.box_2d.map((v: any) => Math.max(0, Math.min(1000, Math.round(Number(v))))) as [number, number, number, number])
+        : [0, 0, 50, 100],
+      isFlaggedMistake: false,
+    })).filter((w: DetectedWord) => w.word.length > 0);
+
+    allWords.push(...pWords);
+    pagesTranscriptions.push({ pageNumber: p.page_number, text: p.full_text || pWords.map((w) => w.word).join(' ') });
+  }
+
+  const transcribedFullText = pagesTranscriptions.map((pt) => pt.text).join('\n\n--- Page Break ---\n\n');
+
+  console.log(`[Gemini OCR] Extracted ${allWords.length} word tokens across ${parsed.pages.length} page(s).`);
+
+  return { words: allWords, transcribedFullText, pagesTranscriptions };
+}
+
+/**
  * Performs high-accuracy Optical Character Recognition on submission pages
  * using local EasyOCR (with automatic fallback to Tesseract.js if needed).
+ * This is used when Gemini OCR is unavailable (e.g. quota exhausted).
  */
 export async function performDocumentOCR(pages: InputPage[]): Promise<OCRBreakdown> {
   try {

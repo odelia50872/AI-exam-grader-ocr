@@ -33,18 +33,28 @@ def process_page(page):
         clean_b64 = re.sub(r"^data:[a-zA-Z0-9/.-]+;base64,", "", image_b64)
         image_bytes = base64.b64decode(clean_b64)
         img = Image.open(io.BytesIO(image_bytes))
+        orig_width, orig_height = img.size
+        # Downscale image if exceeding 1200px to ensure fast CPU inference
+        max_dim = max(orig_width, orig_height)
+        if max_dim > 1200:
+            scale = 1200.0 / max_dim
+            new_w = max(1, int(orig_width * scale))
+            new_h = max(1, int(orig_height * scale))
+            img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+        # Get actual dimensions used for detection
         img_width, img_height = img.size
 
         # Convert to RGB numpy array
         img_rgb = np.array(img.convert("RGB"))
 
-        # Run EasyOCR with tuned word-level segmentation parameters
+        # Run EasyOCR with fast parameters optimized for CPU
         detections = reader.readtext(
             img_rgb,
             paragraph=False,
-            width_ths=0.1,       # Prevents merging words horizontally into single wide line boxes
-            link_threshold=0.6,  # Higher threshold avoids linking across whitespace gaps
-            mag_ratio=1.5,       # Magnification for sharper handwriting & character boundary detection
+            width_ths=0.2,
+            link_threshold=0.5,
+            mag_ratio=1.0,
             detail=1
         )
 

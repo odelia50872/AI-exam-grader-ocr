@@ -4,7 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import 'dotenv/config';
 import { GoogleGenAI, Type } from '@google/genai';
-import { performDocumentOCR, InputPage } from './server/ocrService.js';
+import { performDocumentOCR, performGeminiOCR, InputPage } from './server/ocrService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -322,10 +322,37 @@ app.post('/api/assess-exam', async (req, res) => {
       return res.status(500).json({ error: 'GEMINI_API_KEY is not configured in the server environment.' });
     }
 
-    // Step 1: Perform High-Accuracy Word-Level OCR using EasyOCR
-    console.log(`[OCR Engine] Running EasyOCR across ${inputPages.length} submission page(s)...`);
-    const ocrBreakdown = await performDocumentOCR(inputPages);
-    console.log(`[OCR Engine] Extracted ${ocrBreakdown.words.length} words across ${inputPages.length} page(s).`);
+    // Step 1: OCR — try Gemini Vision first (fast, no local model), fall back to
+    // local EasyOCR only when Gemini returns a quota / rate-limit error (429).
+    let ocrBreakdown;
+    let ocrEngine = 'Gemini Vision';
+
+    const isQuotaError = (err: any): boolean => {
+      const msg: string = (err?.message || err?.status || '').toLowerCase();
+      const code = err?.status || err?.code || 0;
+      return (
+        code === 429 ||
+        msg.includes('resource_exhausted') ||
+        msg.includes('quota') ||
+        msg.includes('rate limit') ||
+        msg.includes('too many requests')
+      );
+    };
+
+    try {
+      console.log(`[OCR Engine] Running Gemini Vision OCR across ${inputPages.length} submission page(s)...`);
+      ocrBreakdown = await performGeminiOCR(inputPages, process.env.GEMINI_API_KEY!, model);
+    } catch (geminiOcrErr: any) {
+      if (isQuotaError(geminiOcrErr)) {
+        console.warn('[OCR Engine] Gemini quota/rate-limit reached — activating local EasyOCR fallback...');
+        ocrEngine = 'EasyOCR (local fallback)';
+        ocrBreakdown = await performDocumentOCR(inputPages);
+      } else {
+        throw geminiOcrErr;
+      }
+    }
+
+    console.log(`[OCR Engine] OCR complete via ${ocrEngine} — extracted ${ocrBreakdown.words.length} words.`);
 
     // Step 2: Build Gemini Request for Autonomous Solution Generation & Academic Assessment
     // We pass the transcribed text and image parts to Gemini
@@ -441,6 +468,7 @@ Return your response strictly in JSON following the schema.
         gradingEvaluation: evaluation,
       },
       modelUsed: selectedModel,
+      ocrEngine,
     });
   } catch (error: any) {
     console.error('Error during exam assessment:', error);
@@ -455,7 +483,7 @@ Return your response strictly in JSON following the schema.
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    engine: 'EasyOCR Engine + Gemini 3.8 Autonomous Grader',
+    engine: 'Gemini Vision OCR (with EasyOCR local fallback on quota) + Gemini Autonomous Grader',
   });
 });
 
