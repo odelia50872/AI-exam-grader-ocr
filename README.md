@@ -32,9 +32,3 @@ An intelligent, automated exam assessment system that uses **Google Gemini Visio
 
 ---
 
-### Installation & Setup
-
-1. **Clone the repository:**
-   ```bash
-   git clone [https://github.com/your-username/exam-lens.git](https://github.com/your-username/exam-lens.git)
-   cd exam-lens
