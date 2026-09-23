@@ -1,0 +1,6 @@
+{
+  "name": "ExamLens OCR & AI Grader",
+  "description": "AI-powered exam assessment and word-level OCR analysis application using Gemini 2.5 Pro with bounding box overlays, relaxed fair grading, and detailed rubric evaluation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
